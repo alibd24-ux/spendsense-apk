@@ -33,13 +33,396 @@ jobs:
           gradle-version: '8.7'
           cache-disabled: true
 
-      - name: Build Debug APK
+      - name: Auto-Fix Android Manifest & Resources and Build APK
         run: |
           MANIFEST_FILE=$(find . -name "AndroidManifest.xml" | grep "src/main/AndroidManifest.xml" | head -n 1)
           ANDROID_DIR=$(dirname $(dirname $(dirname $(dirname "$MANIFEST_FILE"))))
-          echo "Building in: $ANDROID_DIR"
+          echo "Found Android project at: $ANDROID_DIR"
           cd "$ANDROID_DIR"
-          gradle assembleDebug --no-daemon --stacktrace
+
+          # 1. Fix clean build.gradle
+          cat << 'EOF' > build.gradle
+          buildscript {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+              dependencies {
+                  classpath 'com.android.tools.build:gradle:8.5.2'
+              }
+          }
+          EOF
+
+          # 2. Fix app/build.gradle (Zero external dependency conflicts)
+          cat << 'EOF' > app/build.gradle
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace "app.spendsense.tracker"
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "app.spendsense.tracker"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0.0"
+              }
+
+              buildTypes {
+                  debug {
+                      debuggable true
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF
+
+          # 3. Fix AndroidManifest.xml (Remove forbidden package attribute & use drawable icon)
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.READ_SMS" />
+              <uses-permission android:name="android.permission.RECEIVE_SMS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@drawable/ic_launcher_foreground"
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <receiver
+                      android:name=".SmsReceiver"
+                      android:exported="true"
+                      android:permission="android.permission.BROADCAST_SMS">
+                      <intent-filter android:priority="999">
+                          <action android:name="android.provider.Telephony.SMS_RECEIVED" />
+                      </intent-filter>
+                  </receiver>
+
+                  <service
+                      android:name=".SpendSenseNotificationListener"
+                      android:label="@string/app_name"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          # Remove conflicting mipmap-anydpi-v26 and styles.xml that required AppCompat
+          rm -rf app/src/main/res/mipmap-anydpi-v26
+          rm -f app/src/main/res/values/styles.xml
+
+          # 4. Write pure Android SDK MainActivity.java (no AndroidX version conflicts)
+          cat << 'EOF' > app/src/main/java/app/spendsense/tracker/MainActivity.java
+          package app.spendsense.tracker;
+
+          import android.Manifest;
+          import android.annotation.SuppressLint;
+          import android.app.Activity;
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.IntentFilter;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
+          import android.database.Cursor;
+          import android.graphics.Color;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.os.VibrationEffect;
+          import android.os.Vibrator;
+          import android.speech.RecognizerIntent;
+          import android.util.Base64;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.nio.charset.StandardCharsets;
+          import java.util.ArrayList;
+          import java.util.regex.Pattern;
+
+          public class MainActivity extends Activity {
+              public static final String ACTION_INCOMING_FIN_SMS = "app.spendsense.tracker.INCOMING_FIN_SMS";
+              private static final String PREFS_NAME = "spendsense_native_store";
+              private static final String KEY_BACKUP_JSON = "db_backup_json";
+              private static final int REQ_FILE_CHOOSER = 2001;
+              private static final int REQ_VOICE = 2002;
+
+              private WebView webView;
+              private ValueCallback<Uri[]> filePathCallback;
+
+              private final BroadcastReceiver smsEventReceiver = new BroadcastReceiver() {
+                  @Override
+                  public void onReceive(Context context, Intent intent) {
+                      if (ACTION_INCOMING_FIN_SMS.equals(intent.getAction())) {
+                          String body = intent.getStringExtra("sms_body");
+                          if (body != null && webView != null) {
+                              String escaped = body.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n").replace("\r", "");
+                              webView.post(() -> webView.evaluateJavascript("window.onAndroidIncomingSms && window.onAndroidIncomingSms('" + escaped + "')", null));
+                          }
+                      }
+                  }
+              };
+
+              @SuppressLint({"SetJavaScriptEnabled", "UnspecifiedRegisterReceiverFlag"})
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  getWindow().setStatusBarColor(Color.BLACK);
+                  getWindow().setNavigationBarColor(Color.BLACK);
+
+                  webView = new WebView(this);
+                  setContentView(webView);
+
+                  WebSettings settings = webView.getSettings();
+                  settings.setJavaScriptEnabled(true);
+                  settings.setDomStorageEnabled(true);
+                  settings.setDatabaseEnabled(true);
+                  settings.setAllowFileAccess(true);
+                  settings.setAllowContentAccess(true);
+                  settings.setMediaPlaybackRequiresUserGesture(false);
+                  settings.setCacheMode(WebSettings.LOAD_DEFAULT);
+
+                  webView.addJavascriptInterface(new AndroidBridge(), "AndroidBridge");
+                  webView.setWebViewClient(new WebViewClient());
+                  webView.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public boolean onShowFileChooser(WebView wv, ValueCallback<Uri[]> filePathCb, FileChooserParams fileChooserParams) {
+                          if (filePathCallback != null) {
+                              filePathCallback.onReceiveValue(null);
+                          }
+                          filePathCallback = filePathCb;
+                          try {
+                              Intent intent = fileChooserParams.createIntent();
+                              startActivityForResult(intent, REQ_FILE_CHOOSER);
+                          } catch (Exception e) {
+                              filePathCallback = null;
+                              return false;
+                          }
+                          return true;
+                      }
+                  });
+
+                  webView.setBackgroundColor(Color.BLACK);
+                  webView.loadUrl("file:///android_asset/public/index.html");
+
+                  IntentFilter filter = new IntentFilter(ACTION_INCOMING_FIN_SMS);
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      registerReceiver(smsEventReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+                  } else {
+                      registerReceiver(smsEventReceiver, filter);
+                  }
+              }
+
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  super.onActivityResult(requestCode, resultCode, data);
+                  if (requestCode == REQ_FILE_CHOOSER) {
+                      if (filePathCallback == null) return;
+                      Uri[] results = null;
+                      if (resultCode == RESULT_OK && data != null && data.getDataString() != null) {
+                          results = new Uri[]{Uri.parse(data.getDataString())};
+                      }
+                      filePathCallback.onReceiveValue(results);
+                      filePathCallback = null;
+                  } else if (requestCode == REQ_VOICE) {
+                      if (resultCode == RESULT_OK && data != null) {
+                          ArrayList<String> matches = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
+                          if (matches != null && !matches.isEmpty()) {
+                              String text = matches.get(0).replace("'", "\\'");
+                              webView.post(() -> webView.evaluateJavascript("window.onAndroidVoiceResult && window.onAndroidVoiceResult('" + text + "')", null));
+                              return;
+                          }
+                      }
+                      webView.post(() -> webView.evaluateJavascript("window.onAndroidVoiceResult && window.onAndroidVoiceResult('')", null));
+                  }
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (webView != null) {
+                      webView.evaluateJavascript(
+                          "(window.handleAndroidBack ? window.handleAndroidBack() : 'exit')",
+                          result -> {
+                              if ("\"exit\"".equals(result) || "null".equals(result)) {
+                                  finish();
+                              }
+                          }
+                      );
+                  } else {
+                      super.onBackPressed();
+                  }
+              }
+
+              @Override
+              protected void onDestroy() {
+                  try {
+                      unregisterReceiver(smsEventReceiver);
+                  } catch (Exception ignored) {}
+                  super.onDestroy();
+              }
+
+              public class AndroidBridge {
+                  @JavascriptInterface
+                  public void vibrate(int durationMs) {
+                      try {
+                          Vibrator v = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+                          if (v != null && v.hasVibrator()) {
+                              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                  v.vibrate(VibrationEffect.createOneShot(Math.max(5, durationMs), VibrationEffect.DEFAULT_AMPLITUDE));
+                              } else {
+                                  v.vibrate(Math.max(5, durationMs));
+                              }
+                          }
+                      } catch (Exception ignored) {}
+                  }
+
+                  @JavascriptInterface
+                  public void setStatusBarTheme(String mode) {
+                      runOnUiThread(() -> {
+                          boolean dark = !"light".equalsIgnoreCase(mode);
+                          int bg = dark ? Color.parseColor("#000000") : Color.parseColor("#F5F6FA");
+                          getWindow().setStatusBarColor(bg);
+                          getWindow().setNavigationBarColor(bg);
+                      });
+                  }
+
+                  @JavascriptInterface
+                  public void saveBackupJson(String json) {
+                      try {
+                          SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+                          prefs.edit().putString(KEY_BACKUP_JSON, json).apply();
+                      } catch (Exception ignored) {}
+                  }
+
+                  @JavascriptInterface
+                  public String loadBackupJson() {
+                      try {
+                          SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+                          return prefs.getString(KEY_BACKUP_JSON, "");
+                      } catch (Exception e) {
+                          return "";
+                      }
+                  }
+
+                  @JavascriptInterface
+                  public void startVoiceRecognition(String lang) {
+                      runOnUiThread(() -> {
+                          try {
+                              Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+                              intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+                              intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang != null ? lang : "en-US");
+                              intent.putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak expense (e.g. Lunch 250 taka via bKash)");
+                              startActivityForResult(intent, REQ_VOICE);
+                          } catch (Exception ignored) {}
+                      });
+                  }
+
+                  @JavascriptInterface
+                  public void shareText(String text) {
+                      runOnUiThread(() -> {
+                          Intent sendIntent = new Intent(Intent.ACTION_SEND);
+                          sendIntent.putExtra(Intent.EXTRA_TEXT, text);
+                          sendIntent.setType("text/plain");
+                          startActivity(Intent.createChooser(sendIntent, "Share via"));
+                      });
+                  }
+
+                  @JavascriptInterface
+                  public void saveAndShareTextFile(String fileName, String content, String mimeType) {
+                      runOnUiThread(() -> {
+                          try {
+                              File dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                              if (!dir.exists()) dir.mkdirs();
+                              File outFile = new File(dir, fileName);
+                              try (FileOutputStream fos = new FileOutputStream(outFile)) {
+                                  fos.write(content.getBytes(StandardCharsets.UTF_8));
+                              }
+                          } catch (Exception ignored) {}
+                      });
+                  }
+
+                  @JavascriptInterface
+                  public void saveAndShareBase64File(String fileName, String base64Data, String mimeType, boolean shareImmediately) {
+                      runOnUiThread(() -> {
+                          try {
+                              byte[] bytes = Base64.decode(base64Data, Base64.DEFAULT);
+                              File dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                              if (!dir.exists()) dir.mkdirs();
+                              File outFile = new File(dir, fileName);
+                              try (FileOutputStream fos = new FileOutputStream(outFile)) {
+                                  fos.write(bytes);
+                              }
+                          } catch (Exception ignored) {}
+                      });
+                  }
+
+                  @JavascriptInterface
+                  public String getRecentFinancialSms() {
+                      if (checkSelfPermission(Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) {
+                          requestPermissions(new String[]{Manifest.permission.READ_SMS, Manifest.permission.RECEIVE_SMS}, 101);
+                          return "";
+                      }
+                      StringBuilder sb = new StringBuilder();
+                      Pattern finPattern = Pattern.compile("(bKash|Nagad|Rocket|DBBL|Tk\\.?|BDT|TrxID|TxnID)", Pattern.CASE_INSENSITIVE);
+                      try (Cursor cursor = getContentResolver().query(Uri.parse("content://sms/inbox"), new String[]{"body", "date"}, null, null, "date DESC LIMIT 60")) {
+                          if (cursor != null) {
+                              int count = 0;
+                              while (cursor.moveToNext() && count < 15) {
+                                  String body = cursor.getString(0);
+                                  if (body != null && finPattern.matcher(body).find()) {
+                                      if (sb.length() > 0) sb.append("\n\n");
+                                      sb.append(body.trim());
+                                      count++;
+                                  }
+                              }
+                          }
+                      } catch (Exception ignored) {}
+                      return sb.toString();
+                  }
+              }
+          }
+          EOF
+
+          # 5. Run Gradle Build
+          gradle assembleDebug --no-daemon
 
       - name: Upload SpendSense APK Artifact
         uses: actions/upload-artifact@v4
