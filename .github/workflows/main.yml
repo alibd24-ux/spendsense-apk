@@ -32,13 +32,15 @@ jobs:
           gradle-version: '8.7'
           cache-disabled: true
 
-      - name: Fix Escape Typo and Build Debug APK
+      - name: Fix Java Syntax and Build Debug APK
         run: |
           MANIFEST_FILE=$(find . -name "AndroidManifest.xml" | grep "src/main/AndroidManifest.xml" | head -n 1)
           ANDROID_DIR=$(dirname $(dirname $(dirname $(dirname "$MANIFEST_FILE"))))
           echo "Building Android project inside: $ANDROID_DIR"
           cd "$ANDROID_DIR"
           find app/src/main/java -name "*.java" -exec sed -i 's/Tk\\./Tk/g' {} +
+          sed -i 's/""exit"".equals(result)/result != null \&\& result.contains("exit")/g' app/src/main/java/app/spendsense/tracker/MainActivity.java
+          sed -i 's/package="app.spendsense.tracker"//g' app/src/main/AndroidManifest.xml
           sed -i '/task clean/,+2d' build.gradle
           gradle assembleDebug --no-daemon
 
@@ -48,4 +50,3 @@ jobs:
           name: SpendSense-APK
           path: "**/build/outputs/apk/debug/*.apk"
           if-no-files-found: error
-          
