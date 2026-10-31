@@ -32,7 +32,7 @@ jobs:
           gradle-version: '8.7'
           cache-disabled: true
 
-      - name: Fix Java Syntax and Build Debug APK
+      - name: Fix Kotlin Duplicate Class and Build Debug APK
         run: |
           MANIFEST_FILE=$(find . -name "AndroidManifest.xml" | grep "src/main/AndroidManifest.xml" | head -n 1)
           ANDROID_DIR=$(dirname $(dirname $(dirname $(dirname "$MANIFEST_FILE"))))
@@ -42,6 +42,7 @@ jobs:
           sed -i 's/""exit"".equals(result)/result != null \&\& result.contains("exit")/g' app/src/main/java/app/spendsense/tracker/MainActivity.java
           sed -i 's/package="app.spendsense.tracker"//g' app/src/main/AndroidManifest.xml
           sed -i '/task clean/,+2d' build.gradle
+          sed -i 's/dependencies {/dependencies {\n    implementation platform("org.jetbrains.kotlin:kotlin-bom:1.8.22")/' app/build.gradle
           gradle assembleDebug --no-daemon
 
       - name: Upload SpendSense APK Artifact
